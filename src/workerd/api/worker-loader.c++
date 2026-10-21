@@ -2,6 +2,7 @@
 
 #include <workerd/api/actor.h>
 #include <workerd/api/http.h>
+#include <workerd/api/worker-rpc.h>
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/features.h>
 #include <workerd/io/io-context.h>
@@ -46,6 +47,35 @@ jsg::Ref<Fetcher> WorkerStub::getEntrypoint(jsg::Lock& js,
 
   auto subreqChannel = channel->getEntrypoint(kj::mv(entrypointName), kj::mv(props), limits);
   return js.alloc<Fetcher>(IoContext::current().addObject(kj::mv(subreqChannel)));
+}
+
+jsg::Ref<JsRpcStub> WorkerStub::getEntrypointRpcStub(jsg::Lock& js,
+    jsg::Optional<kj::Maybe<kj::String>> name,
+    jsg::Optional<EntrypointOptions> options) {
+  auto& ioctx = IoContext::current();
+
+  Frankenvalue props;
+  kj::Maybe<ResourceLimits> limits;
+  KJ_IF_SOME(o, options) {
+    KJ_IF_SOME(p, o.props) {
+      props = Frankenvalue::fromJs(js, p.getHandle(js));
+    }
+    limits = o.limits;
+  }
+
+  kj::Maybe<kj::String> entrypointName;
+  KJ_IF_SOME(n, name) {
+    KJ_IF_SOME(n2, n) {
+      if (n2 != "default"_kj) {
+        entrypointName = kj::mv(n2);
+      }
+    }
+  }
+
+  auto subreqChannel = channel->getEntrypoint(kj::mv(entrypointName), kj::mv(props), limits);
+  auto fetcher = js.alloc<Fetcher>(ioctx.addObject(kj::mv(subreqChannel)));
+  auto oneCall = fetcher->getClientForOneCall(js);
+  return js.alloc<JsRpcStub>(ioctx.addObject(kj::heap(kj::mv(oneCall.client))), kj::none);
 }
 
 jsg::Ref<DurableObjectClass> WorkerStub::getDurableObjectClass(jsg::Lock& js,

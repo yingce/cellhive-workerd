@@ -11,6 +11,7 @@ namespace workerd::api {
 
 class Fetcher;
 class DurableObjectClass;
+class JsRpcStub;
 
 // JS stub pointing to a remote Worker loaded using WorkerLoader. This is not a stub for a specific
 // entrypoint, but instead the entire Worker, allowing the caller to call any entrypoint (and
@@ -29,17 +30,27 @@ class WorkerStub: public jsg::Object {
   jsg::Ref<Fetcher> getEntrypoint(jsg::Lock& js,
       jsg::Optional<kj::Maybe<kj::String>> name,
       jsg::Optional<EntrypointOptions> options);
+
+  // Returns a reusable RPC stub for one entrypoint. Unlike getEntrypoint(), whose method calls
+  // each open a fresh JSRPC session, all calls made on the returned stub share one session for
+  // the lifetime of the current request.
+  jsg::Ref<JsRpcStub> getEntrypointRpcStub(jsg::Lock& js,
+      jsg::Optional<kj::Maybe<kj::String>> name,
+      jsg::Optional<EntrypointOptions> options);
   jsg::Ref<DurableObjectClass> getDurableObjectClass(jsg::Lock& js,
       jsg::Optional<kj::Maybe<kj::String>> name,
       jsg::Optional<EntrypointOptions> options);
 
   JSG_RESOURCE_TYPE(WorkerStub, CompatibilityFlags::Reader flags) {
     JSG_METHOD(getEntrypoint);
+    JSG_METHOD(getEntrypointRpcStub);
     JSG_METHOD(getDurableObjectClass);
 
     JSG_TS_OVERRIDE({
       getEntrypoint<T extends Rpc.WorkerEntrypointBranded | undefined>(
           name?: string, options?: WorkerStubEntrypointOptions): Fetcher<T>;
+      getEntrypointRpcStub<T extends Rpc.WorkerEntrypointBranded = Rpc.WorkerEntrypointBranded>(
+          name?: string, options?: WorkerStubEntrypointOptions): Rpc.Stub<Rpc.RpcTargetBranded> & T;
       getDurableObjectClass<T extends Rpc.DurableObjectBranded | undefined>(
           name?: string, options?: WorkerStubEntrypointOptions): DurableObjectClass<T>;
     });

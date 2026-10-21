@@ -1447,3 +1447,29 @@ testfunc = pkgmodule.testfunc
     }
   },
 };
+
+// getEntrypointRpcStub reuses one JSRPC session across multiple calls to a class entrypoint.
+// Without it, every method call on a Fetcher opens a fresh session.
+export let rpcStubReusesSession = {
+  async test(ctrl, env, ctx) {
+    let worker = env.loader.get('rpcStubReusesSession', () => ({
+      compatibilityDate: '2025-01-01',
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          import {WorkerEntrypoint} from "cloudflare:workers";
+          export default class extends WorkerEntrypoint {
+            ping() { return "pong"; }
+            add(a, b) { return a + b; }
+          }
+        `,
+      },
+      globalOutbound: null,
+    }));
+
+    const rpc = worker.getEntrypointRpcStub();
+    assert.strictEqual(await rpc.ping(), 'pong');
+    assert.strictEqual(await rpc.add(2, 3), 5);
+    assert.strictEqual(await rpc.ping(), 'pong');
+  },
+};

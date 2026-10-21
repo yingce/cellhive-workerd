@@ -2716,6 +2716,10 @@ export declare abstract class JsRpcProperty {
   catch(errorHandler: Function): any;
   finally(onFinally: Function): any;
 }
+export declare class JsRpcStub {
+  constructor(object: any);
+  dup(): JsRpcStub;
+}
 export declare abstract class ScheduledEvent extends ExtendableEvent {
   readonly scheduledTime: number;
   readonly cron: string;
@@ -4441,6 +4445,12 @@ export interface WorkerStub {
     name?: string,
     options?: WorkerStubEntrypointOptions,
   ): Fetcher<T>;
+  getEntrypointRpcStub<
+    T extends Rpc.WorkerEntrypointBranded = Rpc.WorkerEntrypointBranded,
+  >(
+    name?: string,
+    options?: WorkerStubEntrypointOptions,
+  ): Rpc.Stub<Rpc.RpcTargetBranded> & T;
   getDurableObjectClass<T extends Rpc.DurableObjectBranded | undefined>(
     name?: string,
     options?: WorkerStubEntrypointOptions,
@@ -4481,6 +4491,8 @@ export interface WorkerLoaderWorkerCode {
 export interface workerdResourceLimits {
   cpuMs?: number;
   subRequests?: number;
+  memoryBytes?: number | bigint;
+  deadlineMs?: number;
 }
 /**
  * The Workers runtime supports a subset of the Performance API, used to measure timing and performance,
