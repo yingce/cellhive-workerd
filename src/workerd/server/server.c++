@@ -3331,7 +3331,23 @@ class QuotaArrayBufferAllocator final: public v8::ArrayBuffer::Allocator {
   void Free(void* data, size_t length) override {
     if (data == nullptr) return;
     std::free(data);
-    used.fetch_sub(length, std::memory_order_acq_rel);
+    size_t current = used.load(std::memory_order_acquire);
+    while (current >= length) {
+      if (used.compare_exchange_weak(current, current - length, std::memory_order_acq_rel,
+              std::memory_order_acquire)) {
+        return;
+      }
+    }
+    // V8 should always free the original length; clamp defensively so a mismatch cannot wrap the
+    // counter and permanently disable the quota.
+    used.store(0, std::memory_order_release);
+  }
+
+  // The quota tracks live external memory, but V8 may not have collected unreachable buffers by
+  // the time the next allocation arrives. Collect before the next request once usage is high.
+  bool needsCollection() const {
+    size_t usedBytes = used.load(std::memory_order_acquire);
+    return usedBytes >= limit - limit / 4;
   }
 
  private:
@@ -3406,6 +3422,16 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
         arrayBufferAllocator->setIsolate(isolate);
       }
       isolate->AddNearHeapLimitCallback(&nearHeapLimitCallback, this);
+    }
+  }
+
+  void maybeCollectExternalMemory() const override {
+    if (arrayBufferAllocator != nullptr && arrayBufferAllocator->needsCollection() &&
+        isolatePtr != nullptr) {
+      // Reclaim external memory that became unreachable after an earlier request. Called before a
+      // new JS scope (and therefore before CPU accounting starts) so the collection is not charged
+      // to the request's CPU budget.
+      isolatePtr->LowMemoryNotification();
     }
   }
 
@@ -4911,6 +4937,7 @@ class Server::WorkerService final: public Service,
       lock.v8Isolate->TerminateExecution();
       return kj::heap<JsLimitScope>(*this, context, lock, kj::none);
     }
+    worker->getIsolate().getLimitEnforcer().maybeCollectExternalMemory();
     kj::Maybe<uint32_t> cpuMs;
     KJ_IF_SOME(configured, limits) {
       cpuMs = configured.cpuMs;

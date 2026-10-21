@@ -40,6 +40,10 @@ class IsolateLimitEnforcer: public kj::Refcounted {
   // Further customize the isolate immediately after startup.
   virtual void customizeIsolate(v8::Isolate* isolate) = 0;
 
+  // Called before entering a JS scope to let the embedder reclaim external memory that became
+  // unreachable after an earlier request. The default does nothing.
+  virtual void maybeCollectExternalMemory() const {}
+
   virtual ActorCacheSharedLruOptions getActorCacheLruOptions() = 0;
 
   // Like LimitEnforcer::enterJs(), but used to enforce limits on script startup.

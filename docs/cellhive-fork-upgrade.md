@@ -52,12 +52,14 @@ engine and it does not replace CellHive's Go control or storage layers.
   with `await` must still be stopped after the total budget is spent.
 - A healthy Worker remains callable after the stopped invocation.
 - Async waiting longer than `cpu_ms` does not consume CPU budget.
-- `memory_bytes` enforces both the dynamic isolate heap and its external memory
-  (ArrayBuffer and WebAssembly backing stores). Exceeding it fails the invocation
-  cleanly instead of aborting the process; the loader drops the condemned isolate
-  so the next `LOADER.get()` for the same name creates a fresh instance. Total
-  process memory can still exceed `memory_bytes` by the heap limit, the near-heap
-  headroom, and isolate baseline, so a process-level cgroup limit remains necessary.
+- `memory_bytes` enforces both the dynamic isolate heap and ArrayBuffer backing
+  stores. Exceeding it fails the invocation cleanly instead of aborting the
+  process; the loader drops the condemned isolate so the next `LOADER.get()` for
+  the same name creates a fresh instance. External memory near the budget is
+  collected between requests so a worker that once used most of its budget does
+  not spuriously fail later allocations before V8 runs a GC. Total process memory
+  can still exceed `memory_bytes` by the heap limit, the near-heap headroom, and
+  isolate baseline, so a process-level cgroup limit remains necessary.
 - Subrequest accounting is scoped to the active invocation.
 - Binding lifecycle and invocation/trace metadata survive binding and Cache
   calls.
@@ -65,6 +67,19 @@ engine and it does not replace CellHive's Go control or storage layers.
   invocation stuck awaiting I/O is aborted once the deadline passes.
 - Multiple method calls on one `getEntrypointRpcStub()` stub succeed on the same
   JSRPC session (a `Fetcher` opens a new session per call).
+
+## Known limitations
+
+- WebAssembly linear memory does not go through V8's `ArrayBuffer::Allocator`, so
+  `memory_bytes` does not bound `WebAssembly.Memory`. Bound it with a
+  process-wide `--wasm-max-mem-pages` V8 flag in the workerd config (for example
+  `8192` pages = 512 MiB) or with a cgroup; a per-isolate cap needs a V8 change.
+- CPU enforcement uses one watchdog thread per dynamic Worker that has `cpu_ms`.
+  Workers without `cpu_ms` do not create a thread.
+- The CPU watchdog measures elapsed time during a JS segment while the budget is
+  accumulated from thread CPU time. A JS segment that blocks in C++ without
+  consuming CPU can therefore be terminated early; ordinary CPU-bound handlers
+  are unaffected.
 
 ## Local verification
 

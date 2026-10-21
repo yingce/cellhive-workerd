@@ -379,3 +379,34 @@ export let memoryLimitEvictsCondemnedIsolate = {
     assert.strictEqual(loads, 2);
   },
 };
+
+// External memory is reclaimed between requests so a worker that once used most of its budget does
+// not fail later allocations solely because V8 has not run a GC yet.
+export let externalMemoryReclaimedBetweenRequests = {
+  async test(ctrl, env, ctx) {
+    let worker = env.loader.get('externalMemoryReclaimedBetweenRequests', () =>
+      makeCode({
+        limits: { memoryBytes: 16 * 1024 * 1024 },
+        modules: {
+          'main.js': `
+            export default {
+              async fetch() {
+                const chunks = [];
+                for (let i = 0; i < 1; i++) {
+                  chunks.push(new Uint8Array(12 * 1024 * 1024).fill(1));
+                }
+                return new Response('ok:' + chunks.length);
+              }
+            };
+          `,
+        },
+      })
+    );
+
+    let first = await worker.getEntrypoint().fetch(new Request('https://example.com/'));
+    assert.strictEqual(await first.text(), 'ok:1');
+
+    let second = await worker.getEntrypoint().fetch(new Request('https://example.com/'));
+    assert.strictEqual(await second.text(), 'ok:1');
+  },
+};
