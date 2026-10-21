@@ -234,6 +234,14 @@ struct ServiceDesignator {
   # TODO(someday): Allow adding an outgoing middleware stack here (see TODO in Service, above).
 }
 
+struct WorkerLimits {
+  # Per-invocation limits for a statically-configured Worker. A zero value means the limit is not
+  # configured. Memory is enforced separately and currently only for dynamically-loaded Workers.
+  cpuMs @0 :UInt32;
+  subRequests @1 :UInt32;
+  deadlineMs @2 :UInt32;
+}
+
 struct Worker {
   union {
     modules @0 :List(Module);
@@ -596,6 +604,8 @@ struct Worker {
   }
 
   globalOutbound @6 :ServiceDesignator = "internet";
+  limits @20 :WorkerLimits;
+
   # Where should the global "fetch" go to? The default is the service called "internet", which
   # should usually be configured to talk to the public internet.
 

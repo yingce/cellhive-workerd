@@ -6002,6 +6002,17 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
     .moduleFallback = conf.hasModuleFallback() ? kj::some(conf.getModuleFallback()) : kj::none,
     .localActorConfigs = localActorConfigs,
     .isDynamic = false,
+    .limits = [&]() -> kj::Maybe<ResourceLimits> {
+      if (!conf.hasLimits()) return kj::none;
+      auto l = conf.getLimits();
+      ResourceLimits result;
+      bool configured = false;
+      if (l.getCpuMs() != 0) { result.cpuMs = l.getCpuMs(); configured = true; }
+      if (l.getSubRequests() != 0) { result.subRequests = l.getSubRequests(); configured = true; }
+      if (l.getDeadlineMs() != 0) { result.deadlineMs = l.getDeadlineMs(); configured = true; }
+      if (!configured) return kj::none;
+      return result;
+    }(),
 
     .globalOutbound{
       .designator = conf.getGlobalOutbound(),

@@ -11,7 +11,8 @@ engine and it does not replace CellHive's Go control or storage layers.
 - CellHive patch: one squashed commit on top of that tag
 - Main touched areas: `src/workerd/server/server.c++`, `src/workerd/io/`,
   `src/workerd/api/cache.c++`, and the worker loader test fixtures.
-- The patch adds dynamic Worker CPU, heap and external-memory limits, invocation-scoped
+- The patch adds dynamic Worker CPU, heap and external-memory limits, static Worker
+  per-invocation CPU/subrequest/deadline limits, invocation-scoped
   subrequest accounting, binding/cache lifecycle metadata, invocation deadline
   enforcement plus propagation, and a reusable JSRPC entrypoint stub
   (`WorkerStub.getEntrypointRpcStub()`) that keeps one session across calls.
@@ -67,6 +68,14 @@ engine and it does not replace CellHive's Go control or storage layers.
   invocation stuck awaiting I/O is aborted once the deadline passes.
 - Multiple method calls on one `getEntrypointRpcStub()` stub succeed on the same
   JSRPC session (a `Fetcher` opens a new session per call).
+
+## Static Worker limits
+
+`Worker.limits` in the static config accepts `cpuMs`, `subRequests`, and `deadlineMs`.
+These are per-invocation limits: exceeding one fails that request and leaves the
+isolate usable, so no service rebuild or process restart is needed. `memoryBytes`
+is intentionally not part of `WorkerLimits`; a condemned isolate cannot be safely
+reused, and static services have no loader-based eviction path.
 
 ## Known limitations
 
