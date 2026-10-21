@@ -1453,8 +1453,38 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 
       auto platform = jsg::defaultPlatform(0);
       WorkerdPlatform v8Platform(*platform);
-      jsg::V8System v8System(v8Platform,
-          KJ_MAP(flag, config.getV8Flags()) -> kj::StringPtr { return flag; }, platform.get());
+
+      // V8 has no per-isolate limit for WebAssembly linear memory. Apply a process-wide default
+      // cap so a Wasm-heavy tenant cannot grow a single memory without bound. A config-provided
+      // --wasm-max-mem-pages takes precedence; the default can be overridden with
+      // CELLHIVE_WASM_MAX_MEM_PAGES.
+      kj::Vector<kj::String> v8FlagStorage;
+      bool hasWasmMaxMemPages = false;
+      for (auto flag: config.getV8Flags()) {
+        kj::String str = kj::str(flag);
+        if (str.startsWith("--wasm-max-mem-pages")) {
+          hasWasmMaxMemPages = true;
+        }
+        v8FlagStorage.add(kj::mv(str));
+      }
+      if (!hasWasmMaxMemPages) {
+        uint64_t pages = 8192;  // 512 MiB
+        if (auto env = getenv("CELLHIVE_WASM_MAX_MEM_PAGES")) {
+          char* end = nullptr;
+          auto parsed = strtoull(env, &end, 10);
+          if (end != env && *end == '\0' && parsed > 0) {
+            pages = parsed;
+          }
+        }
+        v8FlagStorage.add(kj::str("--wasm-max-mem-pages=", pages));
+      }
+
+      kj::Vector<kj::StringPtr> v8Flags;
+      for (auto& flag: v8FlagStorage) {
+        v8Flags.add(flag);
+      }
+
+      jsg::V8System v8System(v8Platform, v8Flags.asPtr(), platform.get());
       auto promise = func(v8System, config);
       KJ_IF_SOME(w, watcher) {
         promise = promise.exclusiveJoin(waitForChanges(w).then([this]() {

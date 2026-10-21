@@ -80,9 +80,13 @@ reused, and static services have no loader-based eviction path.
 ## Known limitations
 
 - WebAssembly linear memory does not go through V8's `ArrayBuffer::Allocator`, so
-  `memory_bytes` does not bound `WebAssembly.Memory`. Bound it with a
-  process-wide `--wasm-max-mem-pages` V8 flag in the workerd config (for example
-  `8192` pages = 512 MiB) or with a cgroup; a per-isolate cap needs a V8 change.
+  `memory_bytes` does not bound `WebAssembly.Memory`. The fork applies a
+  process-wide default of `--wasm-max-mem-pages=8192` (512 MiB per Wasm memory)
+  when the workerd config does not provide the flag; override it with
+  `CELLHIVE_WASM_MAX_MEM_PAGES` or an explicit `v8Flags` entry. This is a
+  per-process/per-memory cap, not a per-tenant quota: multiple Wasm memories and
+  multiple isolates can still add up. A per-isolate cap needs a V8 change, and a
+  cgroup remains necessary.
 - CPU enforcement uses one watchdog thread per dynamic Worker that has `cpu_ms`.
   Workers without `cpu_ms` do not create a thread.
 - The CPU watchdog measures elapsed time during a JS segment while the budget is
