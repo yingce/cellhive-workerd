@@ -1468,7 +1468,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         v8FlagStorage.add(kj::mv(str));
       }
       if (!hasWasmMaxMemPages) {
-        uint64_t pages = 8192;  // 512 MiB
+        uint64_t pages = 2048;  // 128 MiB
         if (auto env = getenv("CELLHIVE_WASM_MAX_MEM_PAGES")) {
           char* end = nullptr;
           auto parsed = strtoull(env, &end, 10);

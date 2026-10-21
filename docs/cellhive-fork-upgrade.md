@@ -81,7 +81,7 @@ reused, and static services have no loader-based eviction path.
 
 - WebAssembly linear memory does not go through V8's `ArrayBuffer::Allocator`, so
   `memory_bytes` does not bound `WebAssembly.Memory`. The fork applies a
-  process-wide default of `--wasm-max-mem-pages=8192` (512 MiB per Wasm memory)
+  process-wide default of `--wasm-max-mem-pages=2048` (128 MiB per Wasm memory)
   when the workerd config does not provide the flag; override it with
   `CELLHIVE_WASM_MAX_MEM_PAGES` or an explicit `v8Flags` entry. This is a
   per-process/per-memory cap, not a per-tenant quota: multiple Wasm memories and
