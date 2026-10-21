@@ -590,7 +590,14 @@ kj::Own<kj::HttpClient> Cache::getHttpClient(IoContext& context,
     TraceContext& traceContext,
     bool enableCompatFlags) {
   auto cacheClient = context.getCacheClient();
+  auto invocation = kj::str(context.getInvocationSpanContext().getInvocationId());
+  auto trace = kj::str(context.getInvocationSpanContext().getTraceId());
+  context.getMetrics().cacheRequestStarted(
+      kj::Maybe<kj::StringPtr>(invocation.asPtr()), kj::Maybe<kj::StringPtr>(trace.asPtr()));
   auto metadata = CacheClient::SubrequestMetadata{
+    .invocationId = kj::mv(invocation),
+    .traceId = kj::mv(trace),
+    .deadline = context.getInvocationDeadline(),
     .cfBlobJson = kj::mv(cfBlobJson),
     .parentSpan = traceContext.getInternalSpanParent(),
     .featureFlagsForFl = kj::none,

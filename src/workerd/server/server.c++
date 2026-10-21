@@ -59,6 +59,13 @@
 
 #include <cstdlib>
 #include <ctime>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <time.h>
 
 namespace workerd::server {
 
@@ -3077,10 +3084,28 @@ void Server::InspectorServiceIsolateRegistrar::registerIsolate(
 
 // =======================================================================================
 namespace {
+
+// Returns the CPU time consumed by the calling thread so far, in nanoseconds, or zero if the
+// platform does not expose a thread CPU clock.
+static uint64_t threadCpuTimeNanos() {
+#if _WIN32
+  // MSVC does not provide clock_gettime(); CPU time in request traces remains zero on Windows.
+  return 0;
+#else
+  timespec ts;
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+    return ts.tv_sec * 1000000000ull + ts.tv_nsec;
+  }
+  return 0;
+#endif
+}
+
 class RequestObserverWithTracer final: public RequestObserver, public WorkerInterface {
  public:
   RequestObserverWithTracer(kj::Maybe<kj::Own<WorkerTracer>> tracer, kj::TaskSet& waitUntilTasks)
-      : tracer(kj::mv(tracer)) {}
+      : tracer(kj::mv(tracer)),
+        startedAt(kj::systemPreciseMonotonicClock().now()),
+        startedCpu(threadCpuTimeNanos()) {}
 
   ~RequestObserverWithTracer() noexcept(false) {
     KJ_IF_SOME(t, tracer) {
@@ -3089,8 +3114,10 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
         auto time = ioContext.now();
         t->recordTimestamp(time);
       }
-      t->setOutcome(
-          outcome, 0 * kj::MILLISECONDS /* cpu time */, 0 * kj::MILLISECONDS /* wall time */);
+      auto wall = kj::systemPreciseMonotonicClock().now() - startedAt;
+      uint64_t nowCpu = threadCpuTimeNanos();
+      auto cpu = nowCpu >= startedCpu ? nowCpu - startedCpu : 0;
+      t->setOutcome(outcome, cpu * kj::NANOSECONDS, wall);
     }
   }
 
@@ -3213,6 +3240,8 @@ class RequestObserverWithTracer final: public RequestObserver, public WorkerInte
 
  private:
   kj::Maybe<kj::Own<WorkerTracer>> tracer;
+  kj::TimePoint startedAt;
+  uint64_t startedCpu = 0;
   kj::Maybe<WorkerInterface&> inner;
   EventOutcome outcome = EventOutcome::OK;
 };
@@ -3278,14 +3307,107 @@ class SequentialSpanSubmitter final: public SpanSubmitter {
   kj::EntropySource& entropySource;
 };
 
-// IsolateLimitEnforcer that enforces no limits.
-class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+// V8's heap limit only covers old-generation objects, not the backing stores of ArrayBuffers and
+// WebAssembly memories. This allocator applies the same per-isolate budget to that external memory
+// so a tenant cannot bypass `memoryBytes` by allocating typed arrays. Rejecting an allocation also
+// condemns the isolate; the JavaScript exception path reports the memory limit.
+class QuotaArrayBufferAllocator final: public v8::ArrayBuffer::Allocator {
  public:
-  v8::Isolate::CreateParams getCreateParams() override {
-    return {};
+  QuotaArrayBufferAllocator(size_t limit, std::shared_ptr<std::atomic<bool>> memoryExceeded)
+      : limit(limit), memoryExceeded(kj::mv(memoryExceeded)) {}
+
+  void setIsolate(v8::Isolate* isolate) {
+    this->isolate = isolate;
   }
 
-  void customizeIsolate(v8::Isolate* isolate) override {}
+  void* Allocate(size_t length) override {
+    return allocate(length);
+  }
+
+  void* AllocateUninitialized(size_t length) override {
+    return allocate(length);
+  }
+
+  void Free(void* data, size_t length) override {
+    if (data == nullptr) return;
+    std::free(data);
+    used.fetch_sub(length, std::memory_order_acq_rel);
+  }
+
+ private:
+  void* allocate(size_t length) {
+    if (length == 0) {
+      // V8 permits a null result for zero-length allocations; do not charge the budget for them.
+      return std::malloc(1);
+    }
+
+    size_t current = used.load(std::memory_order_acquire);
+    for (;;) {
+      if (length > limit || current > limit - length) {
+        exceed();
+        return nullptr;
+      }
+      if (used.compare_exchange_weak(current, current + length, std::memory_order_acq_rel,
+              std::memory_order_acquire)) {
+        break;
+      }
+    }
+
+    void* result = std::malloc(length);
+    if (result == nullptr) {
+      used.fetch_sub(length, std::memory_order_acq_rel);
+      exceed();
+    }
+    return result;
+  }
+
+  void exceed() {
+    memoryExceeded->store(true, std::memory_order_release);
+    if (isolate != nullptr) {
+      isolate->TerminateExecution();
+    }
+  }
+
+  size_t limit;
+  std::atomic<size_t> used{0};
+  std::shared_ptr<std::atomic<bool>> memoryExceeded;
+  v8::Isolate* isolate = nullptr;
+};
+
+// IsolateLimitEnforcer that enforces only the CellHive dynamic-Worker memory limit. A hard V8 heap
+// limit would abort the whole process on exhaustion, so the heap portion is enforced through a
+// near-heap callback instead: the script is terminated while V8 still has headroom to unwind.
+class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+ public:
+  NullIsolateLimitEnforcer(
+      kj::Maybe<uint64_t> memoryBytes, std::shared_ptr<std::atomic<bool>> memoryExceeded)
+      : memoryBytes(memoryBytes), memoryExceeded(kj::mv(memoryExceeded)) {
+    KJ_IF_SOME(bytes, memoryBytes) {
+      arrayBufferAllocator = std::make_shared<QuotaArrayBufferAllocator>(
+          static_cast<size_t>(bytes), this->memoryExceeded);
+    }
+  }
+
+  v8::Isolate::CreateParams getCreateParams() override {
+    v8::Isolate::CreateParams params;
+    KJ_IF_SOME(bytes, memoryBytes) {
+      params.constraints.set_max_old_generation_size_in_bytes(static_cast<size_t>(bytes));
+      if (arrayBufferAllocator != nullptr) {
+        params.array_buffer_allocator_shared = arrayBufferAllocator;
+      }
+    }
+    return params;
+  }
+
+  void customizeIsolate(v8::Isolate* isolate) override {
+    if (memoryBytes != kj::none) {
+      isolatePtr = isolate;
+      if (arrayBufferAllocator != nullptr) {
+        arrayBufferAllocator->setIsolate(isolate);
+      }
+      isolate->AddNearHeapLimitCallback(&nearHeapLimitCallback, this);
+    }
+  }
 
   ActorCacheSharedLruOptions getActorCacheLruOptions() override {
     // TODO(someday): Make this configurable?
@@ -3347,6 +3469,21 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   }
 
  private:
+  static size_t nearHeapLimitCallback(void* data, size_t current, size_t initial) {
+    auto& self = *static_cast<NullIsolateLimitEnforcer*>(data);
+    self.memoryExceeded->store(true, std::memory_order_release);
+    if (self.isolatePtr != nullptr) {
+      // Stop the script at the next interrupt check. The raised limit gives V8 room to unwind and
+      // report the limit instead of aborting the process.
+      self.isolatePtr->TerminateExecution();
+    }
+    return current + (64 * 1024 * 1024);
+  }
+
+  kj::Maybe<uint64_t> memoryBytes;
+  v8::Isolate* isolatePtr = nullptr;
+  std::shared_ptr<QuotaArrayBufferAllocator> arrayBufferAllocator;
+  std::shared_ptr<std::atomic<bool>> memoryExceeded;
   TrackedWasmInstanceList trackedWasmInstances;
 };
 
@@ -3462,6 +3599,8 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::String> dockerPathParam,
       kj::Maybe<kj::String> containerEgressInterceptorImageParam,
       bool isDynamic,
+      kj::Maybe<ResourceLimits> limitsParam,
+      std::shared_ptr<std::atomic<bool>> memoryExceededParam,
       kj::Maybe<kj::Function<void()>> abortIsolateCallback = kj::none,
       kj::Maybe<kj::String> accessBlobHeaderNameParam = kj::none)
       : channelTokenHandler(channelTokenHandler),
@@ -3479,6 +3618,8 @@ class Server::WorkerService final: public Service,
         dockerPath(kj::mv(dockerPathParam)),
         containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImageParam)),
         isDynamic(isDynamic),
+        limits(kj::mv(limitsParam)),
+        memoryExceeded(kj::mv(memoryExceededParam)),
         abortIsolateCallback(kj::mv(abortIsolateCallback)),
         accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)) {}
 
@@ -4222,6 +4363,11 @@ class Server::WorkerService final: public Service,
   kj::Maybe<kj::String> dockerPath;
   kj::Maybe<kj::String> containerEgressInterceptorImage;
   bool isDynamic;
+  kj::Maybe<ResourceLimits> limits;
+  // Shared with NullIsolateLimitEnforcer; set when the isolate's near-heap-limit callback fires.
+  std::shared_ptr<std::atomic<bool>> memoryExceeded;
+  // True once the loader has been asked to forget this condemned isolate.
+  bool memoryAbortNotified = false;
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
   kj::Maybe<kj::String> accessBlobHeaderName;
   kj::Maybe<kj::uint> accessBindingServiceChannel;
@@ -4281,14 +4427,18 @@ class Server::WorkerService final: public Service,
 
     kj::Own<kj::HttpClient> getDefault(CacheClient::SubrequestMetadata metadata) override {
       return kj::heap<CacheHttpClientImpl>(*cacheService, cacheNamespaceHeader, kj::none,
-          kj::mv(metadata.cfBlobJson), kj::mv(metadata.parentSpan));
+          kj::mv(metadata.invocationId), kj::mv(metadata.traceId), kj::mv(metadata.deadline),
+          kj::mv(metadata.cfBlobJson),
+          kj::mv(metadata.parentSpan));
     }
 
     kj::Own<kj::HttpClient> getNamespace(
         kj::StringPtr cacheName, CacheClient::SubrequestMetadata metadata) override {
       auto encodedName = kj::encodeUriComponent(cacheName);
       return kj::heap<CacheHttpClientImpl>(*cacheService, cacheNamespaceHeader, kj::mv(encodedName),
-          kj::mv(metadata.cfBlobJson), kj::mv(metadata.parentSpan));
+          kj::mv(metadata.invocationId), kj::mv(metadata.traceId), kj::mv(metadata.deadline),
+          kj::mv(metadata.cfBlobJson),
+          kj::mv(metadata.parentSpan));
     }
 
    private:
@@ -4301,9 +4451,18 @@ class Server::WorkerService final: public Service,
     CacheHttpClientImpl(IoChannelFactory::SubrequestChannel& parent,
         kj::HttpHeaderId cacheNamespaceHeader,
         kj::Maybe<kj::String> cacheName,
+        kj::Maybe<kj::String> invocationId,
+        kj::Maybe<kj::String> traceId,
+        kj::Maybe<kj::Date> deadline,
         kj::Maybe<kj::String> cfBlobJson,
         SpanParent parentSpan)
-        : client(asHttpClient(parent.startRequest({kj::mv(cfBlobJson), kj::mv(parentSpan)}))),
+        : client(asHttpClient(parent.startRequest({
+            .invocationId = kj::mv(invocationId),
+            .traceId = kj::mv(traceId),
+            .deadline = kj::mv(deadline),
+            .cfBlobJson = kj::mv(cfBlobJson),
+            .parentSpan = kj::mv(parentSpan),
+        }))),
           cacheName(kj::mv(cacheName)),
           cacheNamespaceHeader(cacheNamespaceHeader) {}
 
@@ -4591,13 +4750,177 @@ class Server::WorkerService final: public Service,
   // ---------------------------------------------------------------------------
   // implements LimitEnforcer
   //
-  // No limits are enforced.
+
+  // A single watchdog thread per WorkerService (isolate). JavaScript executes one segment at a
+  // time under the isolate lock, so at most one CPU deadline is ever pending. Reusing the thread
+  // avoids creating and joining a std::thread for every JavaScript execution segment.
+  class CpuWatchdog final {
+   public:
+    CpuWatchdog() = default;
+    ~CpuWatchdog() noexcept(false) {
+      stop();
+    }
+    KJ_DISALLOW_COPY_AND_MOVE(CpuWatchdog);
+
+    // Arms the watchdog with the remaining CPU budget for the current segment.
+    void arm(v8::Isolate* isolate, kj::Duration remaining, std::atomic<bool>* exceeded) {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!thread.joinable()) {
+        thread = std::thread([this]() { run(); });
+      }
+      armed = true;
+      fired = false;
+      this->isolate = isolate;
+      this->exceeded = exceeded;
+      deadline = std::chrono::steady_clock::now() +
+          std::chrono::nanoseconds(static_cast<int64_t>(remaining / kj::NANOSECONDS));
+      ++generation;
+      cv.notify_all();
+    }
+
+    // Disarms the pending deadline. Returns true if the watchdog fired for this arm.
+    bool disarm() {
+      std::lock_guard<std::mutex> lock(mutex);
+      armed = false;
+      ++generation;
+      cv.notify_all();
+      bool result = fired;
+      fired = false;
+      return result;
+    }
+
+    void stop() {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        stopRequested = true;
+        armed = false;
+        ++generation;
+      }
+      cv.notify_all();
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+
+   private:
+    void run() {
+      std::unique_lock<std::mutex> lock(mutex);
+      for (;;) {
+        cv.wait(lock, [&]() { return stopRequested || armed; });
+        if (stopRequested) return;
+
+        auto myGeneration = generation;
+        while (armed && generation == myGeneration && !stopRequested) {
+          if (cv.wait_until(lock, deadline) == std::cv_status::timeout) {
+            if (armed && generation == myGeneration && !stopRequested) {
+              armed = false;
+              fired = true;
+              // Publish the limit before terminating V8 so the exception path can classify the
+              // termination as a CPU limit.
+              exceeded->store(true, std::memory_order_release);
+              isolate->TerminateExecution();
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool armed = false;
+    bool fired = false;
+    bool stopRequested = false;
+    uint64_t generation = 0;
+    std::chrono::steady_clock::time_point deadline;
+    v8::Isolate* isolate = nullptr;
+    std::atomic<bool>* exceeded = nullptr;
+    std::thread thread;
+  };
+
+  class JsLimitScope final {
+   public:
+    JsLimitScope(WorkerService& service, IoContext& context, jsg::Lock& lock,
+        kj::Maybe<uint32_t> cpuMs)
+        : service(service), context(context), isolate(lock.v8Isolate) {
+      KJ_IF_SOME(ms, cpuMs) {
+        trackCpu = true;
+        startedCpu = threadCpuTimeNanos();
+        auto budget = ms * kj::MILLISECONDS;
+        auto used = context.getInvocationCpuTime();
+        auto remaining = used < budget ? budget - used : 0 * kj::NANOSECONDS;
+        service.cpuWatchdog.arm(isolate, remaining, &service.cpuExceeded);
+        armed = true;
+      }
+    }
+    ~JsLimitScope() {
+      if (trackCpu) {
+        auto nowCpu = threadCpuTimeNanos();
+        if (nowCpu >= startedCpu) {
+          context.addInvocationCpuTime((nowCpu - startedCpu) * kj::NANOSECONDS);
+        }
+      }
+      if (armed) {
+        fired = service.cpuWatchdog.disarm();
+        if (fired) {
+          // If the termination has not been consumed yet, clear it so it cannot leak into a later
+          // invocation; this segment's execution is already over.
+          isolate->CancelTerminateExecution();
+        }
+      }
+      if (service.memoryExceeded->load(std::memory_order_acquire)) {
+        if (!service.memoryAbortNotified) {
+          service.memoryAbortNotified = true;
+          // Drop the loader's cached stub for this isolate so that a later LOADER.get() creates a
+          // fresh isolate instead of repeatedly hitting the condemned one. The current request
+          // still holds the stub, so the service stays alive until this invocation completes.
+          KJ_IF_SOME(cb, service.abortIsolateCallback) {
+            auto exception = kj::runCatchingExceptions([&]() { cb(); });
+            KJ_IF_SOME(e, exception) {
+              KJ_LOG(ERROR, "abortIsolate callback failed", e);
+            }
+          }
+        }
+        // The isolate is condemned; make sure a pending invocation fails instead of hanging even
+        // if V8's termination was consumed while draining microtasks.
+        context.abort(JSG_KJ_EXCEPTION(FAILED, Error, "Memory limit exceeded."));
+      }
+      if (fired) {
+        service.cpuExceeded.store(true, std::memory_order_release);
+        // If the termination was consumed while draining microtasks, the exception path in
+        // IoContext will not run and the invocation would otherwise hang waiting for a promise
+        // that will never settle. Abort the context so the invocation fails either way.
+        context.abort(JSG_KJ_EXCEPTION(FAILED, Error, "CPU time limit exceeded."));
+      }
+    }
+   private:
+    WorkerService& service;
+    IoContext& context;
+    v8::Isolate* isolate;
+    bool trackCpu = false;
+    uint64_t startedCpu = 0;
+    bool armed = false;
+    bool fired = false;
+  };
 
   kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) override {
-    return {};
+    cpuExceeded.store(false, std::memory_order_release);
+    if (memoryExceeded->load(std::memory_order_acquire)) {
+      // The isolate already exhausted its heap limit. Terminate before running this segment; the
+      // exception path reports the memory limit and the worker stays condemned.
+      lock.v8Isolate->TerminateExecution();
+      return kj::heap<JsLimitScope>(*this, context, lock, kj::none);
+    }
+    kj::Maybe<uint32_t> cpuMs;
+    KJ_IF_SOME(configured, limits) {
+      cpuMs = configured.cpuMs;
+    }
+    return kj::heap<JsLimitScope>(*this, context, lock, cpuMs);
   }
   void topUpActor() override {}
-  void newSubrequest(bool isInHouse) override {}
+  void newSubrequest(bool) override {
+    // Subrequests are counted per invocation by IoContext using getSubrequestLimit().
+  }
   void newKvRequest(KvOpType op) override {}
   void newAnalyticsEngineRequest() override {}
   kj::Promise<void> limitDrain() override {
@@ -4613,13 +4936,36 @@ class Server::WorkerService final: public Service,
     return kj::maxValue;
   }
   kj::Maybe<EventOutcome> getLimitsExceeded() override {
+    if (memoryExceeded->load(std::memory_order_acquire)) return EventOutcome::EXCEEDED_MEMORY;
+    if (cpuExceeded.load(std::memory_order_acquire)) return EventOutcome::EXCEEDED_CPU;
     return kj::none;
   }
   kj::Promise<void> onLimitsExceeded() override {
     return kj::NEVER_DONE;
   }
+  kj::Maybe<kj::Date> getInvocationDeadline() override {
+    KJ_IF_SOME(configured, limits) {
+      KJ_IF_SOME(ms, configured.deadlineMs) {
+        return kj::systemPreciseCalendarClock().now() + ms * kj::MILLISECONDS;
+      }
+    }
+    return kj::none;
+  }
+  kj::Maybe<uint32_t> getSubrequestLimit() override {
+    KJ_IF_SOME(configured, limits) {
+      return configured.subRequests;
+    }
+    return kj::none;
+  }
   void setCpuLimitNearlyExceededCallback(kj::Function<void(void)> cb) override {}
-  void requireLimitsNotExceeded() override {}
+  void requireLimitsNotExceeded() override {
+    if (memoryExceeded->load(std::memory_order_acquire)) {
+      JSG_FAIL_REQUIRE(Error, "Memory limit exceeded.");
+    }
+    if (cpuExceeded.load(std::memory_order_acquire)) {
+      JSG_FAIL_REQUIRE(Error, "CPU time limit exceeded.");
+    }
+  }
   void reportMetrics(RequestObserver& requestMetrics) override {}
   kj::Duration consumeTimeElapsedForPeriodicLogging() override {
     return 0 * kj::SECONDS;
@@ -4627,6 +4973,9 @@ class Server::WorkerService final: public Service,
   size_t getSqliteMemoryUsage() const override {
     return 0;
   }
+
+  std::atomic<bool> cpuExceeded = false;
+  CpuWatchdog cpuWatchdog;
 };
 
 struct FutureSubrequestChannel {
@@ -5085,6 +5434,7 @@ struct Server::WorkerDef {
   kj::Maybe<kj::StringPtr> moduleFallback;
   const kj::HashMap<kj::String, ActorConfig>& localActorConfigs;
   bool isDynamic;
+  kj::Maybe<ResourceLimits> limits;
 
   FutureSubrequestChannel globalOutbound;
   kj::Maybe<FutureSubrequestChannel> cacheApiOutbound;
@@ -5345,6 +5695,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         .moduleFallback = kj::none,
         .localActorConfigs = EMPTY_ACTOR_CONFIGS,
         .isDynamic = true,
+        .limits = source.limits,
 
         // clang-format off
         .globalOutbound{
@@ -5696,7 +6047,13 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
 
   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
   auto observer = kj::atomicRefcounted<IsolateObserver>();
-  auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
+  kj::Maybe<uint64_t> memoryBytes;
+  KJ_IF_SOME(configured, def.limits) {
+    memoryBytes = configured.memoryBytes;
+  }
+  auto memoryExceeded = std::make_shared<std::atomic<bool>>(false);
+  auto limitEnforcer =
+      kj::refcounted<NullIsolateLimitEnforcer>(memoryBytes, memoryExceeded);
 
   // Create the FsMap that will be used to map known file system
   // roots to configurable locations.
@@ -5937,6 +6294,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   // extracted beforehand.
   auto abortIsolateCallback = kj::mv(def.abortIsolateCallback);
   auto accessBlobHeaderName = kj::mv(def.accessBlobHeaderName);
+  auto limits = kj::mv(def.limits);
 
   auto linkCallback = [this, def = kj::mv(def), totalActorChannels](WorkerService& workerService,
                           Worker::ValidationErrorReporter& errorReporter) mutable {
@@ -6124,6 +6482,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
       kj::mv(errorReporter.actorClasses), kj::mv(linkCallback),
       KJ_BIND_METHOD(*this, abortAllActors), KJ_BIND_METHOD(*this, deleteAllActors),
       kj::mv(dockerPath), kj::mv(containerEgressInterceptorImage), def.isDynamic,
+      kj::mv(limits), kj::mv(memoryExceeded),
       kj::mv(abortIsolateCallback), kj::mv(accessBlobHeaderName));
   result->initActorNamespaces(def.localActorConfigs, actorNamespacesByUniqueKey, network);
   co_return result;

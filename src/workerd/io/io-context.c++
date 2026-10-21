@@ -25,6 +25,113 @@
 
 namespace workerd {
 
+namespace {
+
+class LifecycleSubrequestClient final: public WorkerInterface, public kj::Refcounted {
+ public:
+  LifecycleSubrequestClient(kj::Own<WorkerInterface> inner,
+      RequestObserver& observer,
+      uint channel,
+      bool inHouse,
+      kj::Maybe<kj::String> invocationId,
+      kj::Maybe<kj::String> traceId)
+      : inner(kj::mv(inner)),
+        observer(kj::addRef(observer)),
+        channel(channel),
+        inHouse(inHouse),
+        invocationId(kj::mv(invocationId)),
+        traceId(kj::mv(traceId)) {}
+
+  kj::Promise<void> request(kj::HttpMethod method,
+      kj::StringPtr url,
+      const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& requestBody,
+      kj::HttpService::Response& response) override {
+    try {
+      return inner->request(method, url, headers, requestBody, response)
+          .then([self = kj::addRef(*this)]() mutable {
+        self->finish(SubrequestOutcome::COMPLETED);
+      }).catch_([self = kj::addRef(*this)](kj::Exception&& e) mutable -> kj::Promise<void> {
+        self->finish(e.getType() == kj::Exception::Type::DISCONNECTED
+            ? SubrequestOutcome::CANCELED
+            : SubrequestOutcome::FAILED);
+        return kj::Promise<void>(kj::mv(e));
+      });
+    } catch (...) {
+      auto exception = kj::getCaughtExceptionAsKj();
+      finish(exception.getType() == kj::Exception::Type::DISCONNECTED
+          ? SubrequestOutcome::CANCELED
+          : SubrequestOutcome::FAILED);
+      return kj::Promise<void>(kj::mv(exception));
+    }
+  }
+
+  kj::Promise<void> connect(kj::StringPtr host,
+      const kj::HttpHeaders& headers,
+      kj::AsyncIoStream& connection,
+      kj::HttpService::ConnectResponse& response,
+      kj::HttpConnectSettings settings) override {
+    try {
+      return inner->connect(host, headers, connection, response, settings)
+          .then([self = kj::addRef(*this)]() mutable {
+        self->finish(SubrequestOutcome::COMPLETED);
+      }).catch_([self = kj::addRef(*this)](kj::Exception&& e) mutable -> kj::Promise<void> {
+        self->finish(e.getType() == kj::Exception::Type::DISCONNECTED
+            ? SubrequestOutcome::CANCELED
+            : SubrequestOutcome::FAILED);
+        return kj::Promise<void>(kj::mv(e));
+      });
+    } catch (...) {
+      auto exception = kj::getCaughtExceptionAsKj();
+      finish(exception.getType() == kj::Exception::Type::DISCONNECTED
+          ? SubrequestOutcome::CANCELED
+          : SubrequestOutcome::FAILED);
+      return kj::Promise<void>(kj::mv(exception));
+    }
+  }
+
+  kj::Promise<void> prewarm(kj::StringPtr url) override {
+    return inner->prewarm(url);
+  }
+
+  kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override {
+    return inner->runScheduled(scheduledTime, cron);
+  }
+
+  kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override {
+    return inner->runAlarm(scheduledTime, retryCount);
+  }
+
+  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
+    return inner->customEvent(kj::mv(event));
+  }
+
+ private:
+  void finish(SubrequestOutcome outcome) {
+    if (finished) return;
+    finished = true;
+    KJ_IF_SOME(id, invocationId) {
+      KJ_IF_SOME(trace, traceId) {
+        observer->subrequestFinished(channel, inHouse, outcome, id.asPtr(), trace.asPtr());
+        return;
+      }
+      observer->subrequestFinished(channel, inHouse, outcome, id.asPtr(), kj::none);
+      return;
+    }
+    observer->subrequestFinished(channel, inHouse, outcome, kj::none, kj::none);
+  }
+
+  kj::Own<WorkerInterface> inner;
+  kj::Own<RequestObserver> observer;
+  uint channel;
+  bool inHouse;
+  kj::Maybe<kj::String> invocationId;
+  kj::Maybe<kj::String> traceId;
+  bool finished = false;
+};
+
+}  // namespace
+
 static thread_local IoContext* threadLocalRequest = nullptr;
 
 SuppressIoContextScope::SuppressIoContextScope(): cached(threadLocalRequest) {
@@ -158,6 +265,7 @@ IoContext::IoContext(ThreadContext& thread,
       worker(kj::mv(workerParam)),
       actor(actorParam),
       limitEnforcer(kj::mv(limitEnforcerParam)),
+      invocationDeadline(limitEnforcer->getInvocationDeadline()),
       id(nextId()),
       threadId(getThreadId()),
       deleteQueue(kj::arc<DeleteQueue>()),
@@ -205,6 +313,21 @@ IoContext::IoContext(ThreadContext& thread,
 
   // Arrange to abort when limits expire.
   abortWhen(makeLimitsPromise());
+
+  KJ_IF_SOME(deadline, invocationDeadline) {
+    // Enforce the invocation deadline. The abort rejects pending I/O waits, so this catches a
+    // worker that is stuck awaiting I/O. A fully synchronous infinite loop still needs a CPU
+    // limit to interrupt it, since the timer cannot run while the event loop is blocked.
+    auto delay = deadline - kj::systemPreciseCalendarClock().now();
+    if (delay < 0 * kj::NANOSECONDS) {
+      delay = 0 * kj::NANOSECONDS;
+    }
+    abortWhen(getUnsafeTimer().afterDelay(delay).then([]() {
+      // Use a JSG-style description so the caller sees the message as a JavaScript error instead
+      // of a sanitized internal error.
+      JSG_FAIL_REQUIRE(Error, "Invocation deadline exceeded");
+    }));
+  }
 
   KJ_IF_SOME(a, actor) {
     // Arrange to complain if the input gate is broken, which indicates a critical section failed
@@ -1120,7 +1243,18 @@ kj::Own<WorkerInterface> IoContext::getSubrequest(
     kj::FunctionParam<kj::Own<WorkerInterface>(TraceContext&, IoChannelFactory&)> func,
     SubrequestOptions options) {
   limitEnforcer->newSubrequest(options.inHouse);
+  checkSubrequestLimit(options.inHouse);
   return getSubrequestNoChecks(kj::mv(func), kj::mv(options), CountSubrequest::YES);
+}
+
+void IoContext::checkSubrequestLimit(bool inHouse) {
+  if (inHouse) return;
+  KJ_IF_SOME(max, limitEnforcer->getSubrequestLimit()) {
+    if (subrequestCount >= max) {
+      JSG_FAIL_REQUIRE(Error, "Subrequest limit exceeded.");
+    }
+    ++subrequestCount;
+  }
 }
 
 kj::Own<WorkerInterface> IoContext::getSubrequestChannel(
@@ -1196,15 +1330,29 @@ kj::Own<WorkerInterface> IoContext::getSubrequestChannelImpl(uint channel,
     propagatedUserSpanParent = kj::mv(parent);
   }
   IoChannelFactory::SubrequestMetadata metadata{
+    .invocationId = kj::str(getInvocationSpanContext().getInvocationId()),
+    .traceId = kj::str(getInvocationSpanContext().getTraceId()),
+    .deadline = getInvocationDeadline(),
     .cfBlobJson = kj::mv(cfBlobJson),
     .parentSpan = tracing.getInternalSpanParent(),
     .userSpanParent = kj::mv(propagatedUserSpanParent),
     .featureFlagsForFl = mapCopyString(worker->getIsolate().getFeatureFlagsForFl()),
   };
 
+  getMetrics().subrequestStarted(channel, isInHouse,
+      metadata.invocationId.map([](kj::String& value) { return kj::StringPtr(value); }),
+      metadata.traceId.map([](kj::String& value) { return kj::StringPtr(value); }));
+
+  auto invocationId = metadata.invocationId.map([](const kj::String& value) {
+    return kj::str(value);
+  });
+  auto traceId = metadata.traceId.map([](const kj::String& value) {
+    return kj::str(value);
+  });
   auto client = channelFactory.startSubrequest(channel, kj::mv(metadata));
 
-  return client;
+  return kj::refcounted<LifecycleSubrequestClient>(
+      kj::mv(client), getMetrics(), channel, isInHouse, kj::mv(invocationId), kj::mv(traceId));
 }
 
 kj::Own<kj::HttpClient> IoContext::getHttpClient(
@@ -1224,6 +1372,7 @@ kj::Own<CacheClient> IoContext::getCacheClient() {
   //   subrequest limit still applied. Since I can't currently think of a use case for more than 50
   //   cache API requests per request, I'm leaving it as-is for now.
   limitEnforcer->newSubrequest(false);
+  checkSubrequestLimit(false);
   auto ret = getIoChannelFactory().getCache();
 
   // Apply external memory adjustment for Cache API subrequests (same as other subrequests in
@@ -1636,9 +1785,10 @@ bool IoContext::Id::isCurrent() const {
 }
 
 void IoContext::setEntrypointHandler(jsg::Lock& js, jsg::JsObject handler) {
-  KJ_IF_SOME(_, entrypointHandler) {
-    KJ_FAIL_REQUIRE("entrypoint handler has already been set");
-  }
+  // A JSRPC session can dispatch more than one call into the same IoContext when the client holds
+  // a reusable stub (e.g. `WorkerStub.getEntrypointRpcStub()`). Each call constructs its own
+  // handler instance, so keep the handler of the call currently executing; `ctx.restore()` then
+  // refers to that handler rather than failing the second call of the session.
   entrypointHandler = jsg::JsRef<jsg::JsObject>(js, handler);
 }
 

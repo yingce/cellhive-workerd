@@ -329,6 +329,21 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
     return *limitEnforcer;
   }
 
+  // Absolute wall-clock deadline captured when this invocation context was created.
+  kj::Maybe<kj::Date> getInvocationDeadline() const {
+    return invocationDeadline;
+  }
+
+  // CPU time consumed by this invocation so far, accumulated across JavaScript execution
+  // segments. Limit enforcers that apply a per-invocation CPU budget use this to carry the
+  // remaining budget from one segment to the next.
+  kj::Duration getInvocationCpuTime() const {
+    return invocationCpuTime;
+  }
+  void addInvocationCpuTime(kj::Duration time) {
+    invocationCpuTime += time;
+  }
+
   // Get the current input lock. Throws an exception if no input lock is held (e.g. because this is
   // not an actor request).
   InputGate::Lock getInputLock();
@@ -1171,6 +1186,14 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   kj::Own<const Worker> worker;
   kj::Maybe<Worker::Actor&> actor;
   kj::Own<LimitEnforcer> limitEnforcer;
+  kj::Maybe<kj::Date> invocationDeadline;
+
+  // CPU time consumed by this invocation across JavaScript execution segments.
+  kj::Duration invocationCpuTime = 0 * kj::NANOSECONDS;
+
+  // Number of subrequests started by this invocation, accumulated across JavaScript execution
+  // segments. Only maintained when the LimitEnforcer reports a limit.
+  uint32_t subrequestCount = 0;
 
   // List of active IncomingRequests, ordered from most-recently-started to least-recently-started.
   kj::List<IncomingRequest, &IncomingRequest::link> incomingRequests;
@@ -1248,6 +1271,9 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
       TraceContext& tracing,
       IoChannelFactory& channelFactory,
       kj::Maybe<SpanParent> userSpanParent = kj::none);
+
+  // Enforces the per-invocation subrequest limit reported by the LimitEnforcer, if any.
+  void checkSubrequestLimit(bool inHouse);
 
   friend class IoContext_IncomingRequest;
   template <typename T>

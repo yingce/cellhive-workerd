@@ -122,8 +122,9 @@ class MockEntropySource final: public kj::EntropySource {
 };
 
 struct MockLimitEnforcer final: public LimitEnforcer {
-  MockLimitEnforcer(kj::Maybe<uint&> checkedSubrequestCount = kj::none)
-      : checkedSubrequestCount(checkedSubrequestCount) {}
+  MockLimitEnforcer(kj::Maybe<uint&> checkedSubrequestCount = kj::none,
+      kj::Maybe<kj::Date> invocationDeadline = kj::none)
+      : checkedSubrequestCount(checkedSubrequestCount), invocationDeadline(invocationDeadline) {}
 
   kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) override {
     return {};
@@ -154,6 +155,9 @@ struct MockLimitEnforcer final: public LimitEnforcer {
   kj::Promise<void> onLimitsExceeded() override {
     return kj::NEVER_DONE;
   }
+  kj::Maybe<kj::Date> getInvocationDeadline() override {
+    return invocationDeadline;
+  }
   void setCpuLimitNearlyExceededCallback(kj::Function<void(void)> cb) override {}
   void requireLimitsNotExceeded() override {}
   void reportMetrics(RequestObserver& requestMetrics) override {}
@@ -165,6 +169,7 @@ struct MockLimitEnforcer final: public LimitEnforcer {
   }
 
   kj::Maybe<uint&> checkedSubrequestCount;
+  kj::Maybe<kj::Date> invocationDeadline;
 };
 
 struct MockIsolateLimitEnforcer final: public IsolateLimitEnforcer {
@@ -393,7 +398,8 @@ TestFixture::TestFixture(SetupParams&& params)
       headerTable(headerTableBuilder.build()),
       ioChannelFactory(kj::mv(params.ioChannelFactory)),
       requestObserverFactory(kj::mv(params.requestObserverFactory)),
-      checkedSubrequestCount(params.checkedSubrequestCount) {
+      checkedSubrequestCount(params.checkedSubrequestCount),
+      invocationDeadline(params.invocationDeadline) {
   KJ_IF_SOME(id, params.actorId) {
     KJ_IF_SOME(provided, params.actorLoopback) {
       savedActorLoopback = kj::mv(provided);
@@ -480,7 +486,7 @@ void TestFixture::runInIoContext(kj::Function<kj::Promise<void>(const Environmen
 
 kj::Own<IoContext> TestFixture::newIoContext() {
   return kj::refcounted<IoContext>(threadContext, kj::atomicAddRef(*worker), actor,
-      kj::heap<MockLimitEnforcer>(checkedSubrequestCount));
+      kj::heap<MockLimitEnforcer>(checkedSubrequestCount, invocationDeadline));
 }
 
 kj::Own<IoContext::IncomingRequest> TestFixture::newIncomingRequest() {

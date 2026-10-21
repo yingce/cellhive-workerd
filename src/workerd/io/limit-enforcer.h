@@ -186,6 +186,21 @@ class LimitEnforcer {
   // Returns a promise that will reject if and when a limit is exceeded that prevents further
   // JavaScript execution, such as the CPU or memory limit.
   virtual kj::Promise<void> onLimitsExceeded() = 0;
+
+  // Optional absolute wall-clock deadline for the current invocation. Embedders
+  // that have a request deadline return it here; IoContext snapshots it once
+  // and propagates it to binding metadata. The default is no deadline.
+  virtual kj::Maybe<kj::Date> getInvocationDeadline() {
+    return kj::none;
+  }
+
+  // Maximum number of subrequests permitted per invocation, if the embedder enforces such a
+  // limit. IoContext counts subrequests for the lifetime of the invocation (across JavaScript
+  // execution segments) and throws once the limit is reached. The default is no limit.
+  virtual kj::Maybe<uint32_t> getSubrequestLimit() {
+    return kj::none;
+  }
+
   // Sets a callback to call when the cpu limit is nearly exceeded. The callback must be signal safe
   // and cannot take the isolate lock.
   virtual void setCpuLimitNearlyExceededCallback(kj::Function<void(void)>) = 0;

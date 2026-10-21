@@ -19,6 +19,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #ifdef __linux__
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -748,6 +749,8 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
           .addSubCommand("fuzzilli", KJ_BIND_METHOD(*this, getFuzz), "run reprl for fuzzing")
 #endif
           .addSubCommand("test", KJ_BIND_METHOD(*this, getTest), "run unit tests")
+          .addSubCommand("cellhive-build-info", KJ_BIND_METHOD(*this, getCellhiveBuildInfo),
+              "print the CellHive fork build marker")
           .addSubCommand("pyodide-lock", KJ_BIND_METHOD(*this, getPyodideLock),
               "outputs the package lock file used by Pyodide")
           .addSubCommand("make-pyodide-baseline-snapshot",
@@ -765,6 +768,20 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
           "This binary has an embedded configuration.");
       return addServeOptions(builder);
     }
+  }
+
+  kj::MainFunc getCellhiveBuildInfo() {
+    auto builder = kj::MainBuilder(context, getVersionString(),
+        "Print the CellHive workerd fork build marker.");
+    return builder.callAfterParsing([]() -> kj::MainBuilder::Validity {
+#if _WIN32
+      kj::FdOutputStream out(_fileno(stdout));
+#else
+      kj::FdOutputStream out(STDOUT_FILENO);
+#endif
+      out.write(kj::StringPtr("cellhive-workerd-fork/0\n").asBytes());
+      return true;
+    }).build();
   }
 
   kj::MainBuilder& addConfigParsingOptionsNoConstName(kj::MainBuilder& builder) {

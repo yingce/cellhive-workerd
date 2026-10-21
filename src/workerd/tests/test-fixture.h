@@ -64,6 +64,8 @@ struct TestFixture {
     kj::Maybe<kj::Function<kj::Own<RequestObserver>()>> requestObserverFactory;
     // If set, incremented whenever the fixture's limit enforcer checks a new subrequest.
     kj::Maybe<uint&> checkedSubrequestCount;
+    // If set, the fixture's request limit enforcer exposes this invocation deadline.
+    kj::Maybe<kj::Date> invocationDeadline;
     // If set, used as the jsg::IsolateObserver for the worker's isolate instead of a no-op one.
     // Lets tests observe compilation hooks (e.g. onCompileCacheFound / onCompileCacheRejected).
     kj::Maybe<kj::Own<JsgIsolateObserver>> jsgIsolateObserver;
@@ -292,6 +294,7 @@ struct TestFixture {
   kj::Maybe<kj::Function<kj::Rc<IoChannelFactory>(TimerChannel&)>> ioChannelFactory;
   kj::Maybe<kj::Function<kj::Own<RequestObserver>()>> requestObserverFactory;
   kj::Maybe<uint&> checkedSubrequestCount;
+  kj::Maybe<kj::Date> invocationDeadline;
 
   // Construct a fresh Worker::Actor with the given id, using the saved Loopback.
   kj::Own<Worker::Actor> makeActor(Worker::Actor::Id id);

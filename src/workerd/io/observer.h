@@ -43,6 +43,12 @@ enum class ActorRetryOutcome : uint8_t {
   OTHER,
 };
 
+enum class SubrequestOutcome : uint8_t {
+  COMPLETED,
+  FAILED,
+  CANCELED,
+};
+
 class WorkerInterface;
 class LimitEnforcer;
 class TimerChannel;
@@ -156,6 +162,28 @@ class RequestObserver: public kj::Refcounted {
   // to feed retry classification.
   virtual void setNextSubrequestRetryEligibility(
       SubrequestBodyRewindable bodyRewindable, ActorCallTargetRetryable targetRetryable) {}
+
+  // Fired immediately before a binding/subrequest channel is opened. The identifiers are value
+  // metadata carried by IoChannelFactory::SubrequestMetadata, so an embedder can correlate the
+  // call without retaining an IoContext or a capability. The default remains a no-op for stock
+  // embedders.
+  virtual void subrequestStarted(uint channel,
+      bool inHouse,
+      kj::Maybe<kj::StringPtr> invocationId,
+      kj::Maybe<kj::StringPtr> traceId) {}
+
+  // Cache API calls use CacheClient rather than an IoChannelFactory subrequest channel, but they
+  // still participate in the same invocation telemetry contract.
+  virtual void cacheRequestStarted(
+      kj::Maybe<kj::StringPtr> invocationId, kj::Maybe<kj::StringPtr> traceId) {}
+
+  // Fired when the one-shot WorkerInterface returned for a binding call settles. A disconnected
+  // stream is reported as CANCELED; other rejected promises are FAILED.
+  virtual void subrequestFinished(uint channel,
+      bool inHouse,
+      SubrequestOutcome outcome,
+      kj::Maybe<kj::StringPtr> invocationId,
+      kj::Maybe<kj::StringPtr> traceId) {}
 
   // Records an additional outgoing actor call started by a runtime retry loop.
   virtual void recordActorRetry(ActorRetryCallType callType) {}

@@ -44,6 +44,14 @@ WD_STRONG_BOOL(ActorRetryGateEnabled);
 class CacheClient {
  public:
   struct SubrequestMetadata {
+    // Value-only invocation correlation for the cache binding path. Cache requests do not use
+    // IoChannelFactory::SubrequestMetadata, so they carry the same identifiers explicitly.
+    kj::Maybe<kj::String> invocationId;
+    kj::Maybe<kj::String> traceId;
+    // Absolute wall-clock deadline for the invocation that opened this binding call.
+    // Absent means the embedder did not provide a deadline.
+    kj::Maybe<kj::Date> deadline;
+
     // The `request.cf` blob, JSON-encoded.
     kj::Maybe<kj::String> cfBlobJson;
 
@@ -148,6 +156,16 @@ class IoChannelFactory: public virtual kj::Refcounted {
   // Contains metadata attached to an outgoing subrequest from a worker, independent of the type
   // of request.
   struct SubrequestMetadata {
+    // Stable identifiers for the invocation that opened this binding call. These are deliberately
+    // value fields rather than a capability or a pointer into IoContext: an embedder may forward
+    // the metadata over a private transport and must not extend the isolate lifetime. They give
+    // binding adapters one common correlation contract for metrics and tracing.
+    kj::Maybe<kj::String> invocationId;
+    kj::Maybe<kj::String> traceId;
+    // Absolute wall-clock deadline for the invocation that opened this binding call.
+    // Absent means the embedder did not provide a deadline.
+    kj::Maybe<kj::Date> deadline;
+
     // The `request.cf` blob, JSON-encoded.
     kj::Maybe<kj::String> cfBlobJson;
 
@@ -537,11 +555,17 @@ class IoChannelFactory: public virtual kj::Refcounted {
 struct ResourceLimits {
   jsg::Optional<uint32_t> cpuMs;
   jsg::Optional<uint32_t> subRequests;
+  // Maximum V8 old-generation heap in bytes. This is an isolate heap boundary;
+  // external memory and process RSS remain outside this limit.
+  jsg::Optional<uint64_t> memoryBytes;
+  // Optional wall-clock deadline for each invocation of the dynamically loaded worker.
+  // This is separate from cpuMs: CPU time and elapsed time are different limits.
+  jsg::Optional<uint32_t> deadlineMs;
 
-  JSG_STRUCT(cpuMs, subRequests);
+  JSG_STRUCT(cpuMs, subRequests, memoryBytes, deadlineMs);
 
   ResourceLimits clone() const {
-    return {cpuMs, subRequests};
+    return {cpuMs, subRequests, memoryBytes, deadlineMs};
   }
 };
 
