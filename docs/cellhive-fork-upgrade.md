@@ -77,6 +77,11 @@ isolate usable, so no service rebuild or process restart is needed. `memoryBytes
 is intentionally not part of `WorkerLimits`; a condemned isolate cannot be safely
 reused, and static services have no loader-based eviction path.
 
+- `abortIsolate()` records an abort reason before terminating JS, so the current
+  invocation fails with `Worker execution was aborted (isolate aborted): ...`
+  instead of `script terminated for unknown reasons`. The message intentionally
+  matches the loader's `execution.*abort` retirement filter.
+
 ## Known limitations
 
 - WebAssembly linear memory does not go through V8's `ArrayBuffer::Allocator`, so

@@ -72,6 +72,10 @@ void EntrypointsModule::abortIsolate(jsg::Lock& js, jsg::Optional<kj::String> re
   auto& r = reason.orDefault(nullptr);
   KJ_IF_SOME(context, IoContext::tryCurrent()) {
     context.abortIsolate(r);
+    // Terminating execution without recording why makes IoContext report "script terminated for
+    // unknown reasons". Record the abort reason so the current invocation fails with a useful
+    // error while the isolate is being torn down.
+    context.abort(JSG_KJ_EXCEPTION(FAILED, Error, "Worker execution was aborted (isolate aborted): ", r));
   }
   js.terminateExecutionNow();
 }
